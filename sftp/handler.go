@@ -27,32 +27,40 @@ const (
 )
 
 type Handler struct {
-	mu sync.Mutex
-
-	permissions []string
+	mu          sync.Mutex
 	server      *server.Server
 	fs          *filesystem.Filesystem
+	events      *eventHandler
+	permissions []string
 	logger      *log.Entry
 	ro          bool
 }
 
-// Returns a new connection handler for the SFTP server. This allows a given user
+// NewHandler returns a new connection handler for the SFTP server. This allows a given user
 // to access the underlying filesystem.
-func NewHandler(sc *ssh.ServerConn, srv *server.Server) *Handler {
+func NewHandler(sc *ssh.ServerConn, srv *server.Server) (*Handler, error) {
+	uuid, ok := sc.Permissions.Extensions["user"]
+	if !ok {
+		return nil, errors.New("sftp: mismatched Wings and Panel versions — Panel 1.10 is required for this version of Wings.")
+	}
+
+	events := eventHandler{
+		ip:     sc.RemoteAddr().String(),
+		user:   uuid,
+		server: srv.ID(),
+	}
+
 	return &Handler{
 		permissions: strings.Split(sc.Permissions.Extensions["permissions"], ","),
 		server:      srv,
 		fs:          srv.Filesystem(),
+		events:      &events,
 		ro:          config.Get().System.Sftp.ReadOnly,
-		logger: log.WithFields(log.Fields{
-			"subsystem": "sftp",
-			"username":  sc.User(),
-			"ip":        sc.RemoteAddr(),
-		}),
-	}
+		logger:      log.WithFields(log.Fields{"subsystem": "sftp", "user": uuid, "ip": sc.RemoteAddr()}),
+	}, nil
 }
 
-// Returns the sftp.Handlers for this struct.
+// Handlers returns the sftp.Handlers for this struct.
 func (h *Handler) Handlers() sftp.Handlers {
 	return sftp.Handlers{
 		FileGet:  h,
@@ -119,6 +127,14 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
 	}
+	// Chown may or may not have been called in the touch function, so always do
+	// it at this point to avoid the file being improperly owned.
+	_ = h.fs.Chown(request.Filepath)
+	event := server.ActivitySftpWrite
+	if permission == PermissionFileCreate {
+		event = server.ActivitySftpCreate
+	}
+	h.events.MustLog(event, FileAction{Entity: request.Filepath})
 	return f, nil
 }
 
@@ -169,6 +185,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			l.WithField("error", err).Error("failed to rename file")
 			return sftp.ErrSSHFxFailure
 		}
+		h.events.MustLog(server.ActivitySftpRename, FileAction{Entity: request.Filepath, Target: request.Target})
 		break
 	// Handle deletion of a directory. This will properly delete all of the files and
 	// folders within that directory if it is not already empty (unlike a lot of SFTP
@@ -177,10 +194,12 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileDelete) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Delete(request.Filepath); err != nil {
+		p := filepath.Clean(request.Filepath)
+		if err := h.fs.Delete(p); err != nil {
 			l.WithField("error", err).Error("failed to remove directory")
 			return sftp.ErrSSHFxFailure
 		}
+		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
 		return sftp.ErrSSHFxOk
 	// Handle requests to create a new Directory.
 	case "Mkdir":
@@ -188,11 +207,12 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxPermissionDenied
 		}
 		name := strings.Split(filepath.Clean(request.Filepath), "/")
-		err := h.fs.CreateDirectory(name[len(name)-1], strings.Join(name[0:len(name)-1], "/"))
-		if err != nil {
+		p := strings.Join(name[0:len(name)-1], "/")
+		if err := h.fs.CreateDirectory(name[len(name)-1], p); err != nil {
 			l.WithField("error", err).Error("failed to create directory")
 			return sftp.ErrSSHFxFailure
 		}
+		h.events.MustLog(server.ActivitySftpCreateDirectory, FileAction{Entity: request.Filepath})
 		break
 	// Support creating symlinks between files. The source and target must resolve within
 	// the server home directory.
@@ -225,6 +245,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			l.WithField("error", err).Error("failed to remove a file")
 			return sftp.ErrSSHFxFailure
 		}
+		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
 		return sftp.ErrSSHFxOk
 	default:
 		return sftp.ErrSSHFxOpUnsupported
@@ -284,15 +305,10 @@ func (h *Handler) can(permission string) bool {
 	if h.server.IsSuspended() {
 		return false
 	}
-
-	// SFTPServer owners and super admins have their permissions returned as '[*]' via the Panel
-	// API, so for the sake of speed do an initial check for that before iterating over the
-	// entire array of permissions.
-	if len(h.permissions) == 1 && h.permissions[0] == "*" {
-		return true
-	}
 	for _, p := range h.permissions {
-		if p == permission {
+		// If we match the permission specifically, or the user has been granted the "*"
+		// permission because they're an admin, let them through.
+		if p == permission || p == "*" {
 			return true
 		}
 	}

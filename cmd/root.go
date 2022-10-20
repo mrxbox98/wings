@@ -7,12 +7,17 @@ import (
 	"fmt"
 	log2 "log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pterodactyl/wings/internal/cron"
+	"github.com/pterodactyl/wings/internal/database"
 
 	"github.com/NYTimes/logrotate"
 	"github.com/apex/log"
@@ -20,7 +25,6 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/gammazero/workerpool"
 	"github.com/mitchellh/colorstring"
-	"github.com/pkg/profile"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -75,8 +79,10 @@ func init() {
 	rootCommand.PersistentFlags().BoolVar(&debug, "debug", false, "pass in order to run wings in debug mode")
 
 	// Flags specifically used when running the API.
-	rootCommand.Flags().String("profiler", "", "the profiler to run for this instance")
-	rootCommand.Flags().Bool("auto-tls", false, "pass in order to have wings generate and manage it's own SSL certificates using Let's Encrypt")
+	rootCommand.Flags().Bool("pprof", false, "if the pprof profiler should be enabled. The profiler will bind to localhost:6060 by default")
+	rootCommand.Flags().Int("pprof-block-rate", 0, "enables block profile support, may have performance impacts")
+	rootCommand.Flags().Int("pprof-port", 6060, "If provided with --pprof, the port it will run on")
+	rootCommand.Flags().Bool("auto-tls", false, "pass in order to have wings generate and manage its own SSL certificates using Let's Encrypt")
 	rootCommand.Flags().String("tls-hostname", "", "required with --auto-tls, the FQDN for the generated SSL certificate")
 	rootCommand.Flags().Bool("ignore-certificate-errors", false, "ignore certificate verification errors when executing API calls")
 
@@ -86,25 +92,6 @@ func init() {
 }
 
 func rootCmdRun(cmd *cobra.Command, _ []string) {
-	switch cmd.Flag("profiler").Value.String() {
-	case "cpu":
-		defer profile.Start(profile.CPUProfile).Stop()
-	case "mem":
-		defer profile.Start(profile.MemProfile).Stop()
-	case "alloc":
-		defer profile.Start(profile.MemProfile, profile.MemProfileAllocs).Stop()
-	case "heap":
-		defer profile.Start(profile.MemProfile, profile.MemProfileHeap).Stop()
-	case "routines":
-		defer profile.Start(profile.GoroutineProfile).Stop()
-	case "mutex":
-		defer profile.Start(profile.MutexProfile).Stop()
-	case "threads":
-		defer profile.Start(profile.ThreadcreationProfile).Stop()
-	case "block":
-		defer profile.Start(profile.BlockProfile).Stop()
-	}
-
 	printLogo()
 	log.Debug("running in debug mode")
 	log.WithField("config_file", configPath).Info("loading configuration from file")
@@ -146,6 +133,10 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		}),
 	)
 
+	if err := database.Initialize(); err != nil {
+		log.WithField("error", err).Fatal("failed to initialize database")
+	}
+
 	manager, err := server.NewManager(cmd.Context(), pclient)
 	if err != nil {
 		log.WithField("error", err).Fatal("failed to load server configurations")
@@ -172,7 +163,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	ticker := time.NewTicker(time.Minute)
 	// Every minute, write the current server states to the disk to allow for a more
 	// seamless hard-reboot process in which wings will re-sync server states based
-	// on it's last tracked state.
+	// on its last tracked state.
 	go func() {
 		for {
 			select {
@@ -275,6 +266,13 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		}
 	}()
 
+	if s, err := cron.Scheduler(cmd.Context(), manager); err != nil {
+		log.WithField("error", err).Fatal("failed to initialize cron system")
+	} else {
+		log.WithField("subsystem", "cron").Info("starting cron processes")
+		s.StartAsync()
+	}
+
 	go func() {
 		// Run the SFTP server.
 		if err := sftp.New(manager).Run(); err != nil {
@@ -325,6 +323,20 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		TLSConfig: config.DefaultTLSConfig,
 	}
 
+	profile, _ := cmd.Flags().GetBool("pprof")
+	if profile {
+		if r, _ := cmd.Flags().GetInt("pprof-block-rate"); r > 0 {
+			runtime.SetBlockProfileRate(r)
+		}
+		// Catch at least 1% of mutex contention issues.
+		runtime.SetMutexProfileFraction(100)
+
+		profilePort, _ := cmd.Flags().GetInt("pprof-port")
+		go func() {
+			http.ListenAndServe(fmt.Sprintf("localhost:%d", profilePort), nil)
+		}()
+	}
+
 	// Check if the server should run with TLS but using autocert.
 	if autotls {
 		m := autocert.Manager{
@@ -355,7 +367,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// Check if main http server should run with TLS. Otherwise reset the TLS
 	// config on the server and then serve it over normal HTTP.
 	if api.Ssl.Enabled {
-		if err := s.ListenAndServeTLS(strings.ToLower(api.Ssl.CertificateFile), strings.ToLower(api.Ssl.KeyFile)); err != nil {
+		if err := s.ListenAndServeTLS(api.Ssl.CertificateFile, api.Ssl.KeyFile); err != nil {
 			log.WithFields(log.Fields{"auto_tls": false, "error": err}).Fatal("failed to configure HTTPS server")
 		}
 		return

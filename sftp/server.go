@@ -68,9 +68,14 @@ func (c *SFTPServer) Run() error {
 	}
 
 	conf := &ssh.ServerConfig{
-		NoClientAuth:     false,
-		MaxAuthTries:     6,
-		PasswordCallback: c.passwordCallback,
+		NoClientAuth: false,
+		MaxAuthTries: 6,
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			return c.makeCredentialsRequest(conn, remote.SftpAuthPassword, string(password))
+		},
+		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			return c.makeCredentialsRequest(conn, remote.SftpAuthPublicKey, string(ssh.MarshalAuthorizedKey(key)))
+		},
 	}
 	conf.AddHostKey(private)
 
@@ -86,19 +91,21 @@ func (c *SFTPServer) Run() error {
 		if conn, _ := listener.Accept(); conn != nil {
 			go func(conn net.Conn) {
 				defer conn.Close()
-				c.AcceptInbound(conn, conf)
+				if err := c.AcceptInbound(conn, conf); err != nil {
+					log.WithField("error", err).Error("sftp: failed to accept inbound connection")
+				}
 			}(conn)
 		}
 	}
 }
 
-// Handles an inbound connection to the instance and determines if we should serve the
-// request or not.
-func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) {
+// AcceptInbound handles an inbound connection to the instance and determines if we should
+// serve the request or not.
+func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) error {
 	// Before beginning a handshake must be performed on the incoming net.Conn
 	sconn, chans, reqs, err := ssh.NewServerConn(conn, config)
 	if err != nil {
-		return
+		return errors.WithStack(err)
 	}
 	defer sconn.Close()
 	go ssh.DiscardRequests(reqs)
@@ -144,11 +151,17 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) {
 
 		// Spin up a SFTP server instance for the authenticated user's server allowing
 		// them access to the underlying filesystem.
-		handler := sftp.NewRequestServer(channel, NewHandler(sconn, srv).Handlers())
-		if err := handler.Serve(); err == io.EOF {
-			handler.Close()
+		handler, err := NewHandler(sconn, srv)
+		if err != nil {
+			return errors.WithStackIf(err)
+		}
+		rs := sftp.NewRequestServer(channel, handler.Handlers())
+		if err := rs.Serve(); err == io.EOF {
+			_ = rs.Close()
 		}
 	}
+
+	return nil
 }
 
 // Generates a new ED25519 private key that is used for host authentication when
@@ -177,17 +190,17 @@ func (c *SFTPServer) generateED25519PrivateKey() error {
 	return nil
 }
 
-// A function capable of validating user credentials with the Panel API.
-func (c *SFTPServer) passwordCallback(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.SftpAuthRequestType, p string) (*ssh.Permissions, error) {
 	request := remote.SftpAuthRequest{
+		Type:          t,
 		User:          conn.User(),
-		Pass:          string(pass),
+		Pass:          p,
 		IP:            conn.RemoteAddr().String(),
 		SessionID:     conn.SessionID(),
 		ClientVersion: conn.ClientVersion(),
 	}
 
-	logger := log.WithFields(log.Fields{"subsystem": "sftp", "username": conn.User(), "ip": conn.RemoteAddr().String()})
+	logger := log.WithFields(log.Fields{"subsystem": "sftp", "method": request.Type, "username": request.User, "ip": request.IP})
 	logger.Debug("validating credentials for SFTP connection")
 
 	if !validUsernameRegexp.MatchString(request.User) {
@@ -206,15 +219,16 @@ func (c *SFTPServer) passwordCallback(conn ssh.ConnMetadata, pass []byte) (*ssh.
 	}
 
 	logger.WithField("server", resp.Server).Debug("credentials validated and matched to server instance")
-	sshPerm := &ssh.Permissions{
+	permissions := ssh.Permissions{
 		Extensions: map[string]string{
+			"ip":          conn.RemoteAddr().String(),
 			"uuid":        resp.Server,
-			"user":        conn.User(),
+			"user":        resp.User,
 			"permissions": strings.Join(resp.Permissions, ","),
 		},
 	}
 
-	return sshPerm, nil
+	return &permissions, nil
 }
 
 // PrivateKeyPath returns the path the host private key for this server instance.

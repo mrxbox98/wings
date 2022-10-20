@@ -27,8 +27,7 @@ type Metadata struct {
 var _ environment.ProcessEnvironment = (*Environment)(nil)
 
 type Environment struct {
-	mu      sync.RWMutex
-	eventMu sync.Once
+	mu sync.RWMutex
 
 	// The public identifier for this environment. In this case it is the Docker container
 	// name that will be used for all instances created under it.
@@ -49,7 +48,10 @@ type Environment struct {
 	// Holds the stats stream used by the polling commands so that we can easily close it out.
 	stats io.ReadCloser
 
-	emitter *events.EventBus
+	emitter *events.Bus
+
+	logCallbackMx sync.Mutex
+	logCallback   func([]byte)
 
 	// Tracks the environment state.
 	st *system.AtomicString
@@ -71,6 +73,7 @@ func New(id string, m *Metadata, c *environment.Configuration) (*Environment, er
 		meta:          m,
 		client:        cli,
 		st:            system.NewAtomicString(environment.ProcessOfflineState),
+		emitter:       events.NewBus(),
 	}
 
 	return e, nil
@@ -84,46 +87,43 @@ func (e *Environment) Type() string {
 	return "docker"
 }
 
-// Set if this process is currently attached to the process.
+// SetStream sets the current stream value from the Docker client. If a nil
+// value is provided we assume that the stream is no longer operational and the
+// instance is effectively offline.
 func (e *Environment) SetStream(s *types.HijackedResponse) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	e.stream = s
+	e.mu.Unlock()
 }
 
-// Determine if the this process is currently attached to the container.
+// IsAttached determine if the this process is currently attached to the
+// container instance by checking if the stream is nil or not.
 func (e *Environment) IsAttached() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
 	return e.stream != nil
 }
 
-func (e *Environment) Events() *events.EventBus {
-	e.eventMu.Do(func() {
-		e.emitter = events.New()
-	})
-
+// Events returns an event bus for the environment.
+func (e *Environment) Events() *events.Bus {
 	return e.emitter
 }
 
-// Determines if the container exists in this environment. The ID passed through should be the
-// server UUID since containers are created utilizing the server UUID as the name and docker
-// will work fine when using the container name as the lookup parameter in addition to the longer
-// ID auto-assigned when the container is created.
+// Exists determines if the container exists in this environment. The ID passed
+// through should be the server UUID since containers are created utilizing the
+// server UUID as the name and docker will work fine when using the container
+// name as the lookup parameter in addition to the longer ID auto-assigned when
+// the container is created.
 func (e *Environment) Exists() (bool, error) {
-	_, err := e.client.ContainerInspect(context.Background(), e.Id)
+	_, err := e.ContainerInspect(context.Background())
 	if err != nil {
 		// If this error is because the container instance wasn't found via Docker we
 		// can safely ignore the error and just return false.
 		if client.IsErrNotFound(err) {
 			return false, nil
 		}
-
 		return false, err
 	}
-
 	return true, nil
 }
 
@@ -137,17 +137,17 @@ func (e *Environment) Exists() (bool, error) {
 //
 // @see docker/client/errors.go
 func (e *Environment) IsRunning(ctx context.Context) (bool, error) {
-	c, err := e.client.ContainerInspect(ctx, e.Id)
+	c, err := e.ContainerInspect(ctx)
 	if err != nil {
 		return false, err
 	}
 	return c.State.Running, nil
 }
 
-// Determine the container exit state and return the exit code and whether or not
+// ExitState returns the container exit state, the exit code and whether or not
 // the container was killed by the OOM killer.
 func (e *Environment) ExitState() (uint32, bool, error) {
-	c, err := e.client.ContainerInspect(context.Background(), e.Id)
+	c, err := e.ContainerInspect(context.Background())
 	if err != nil {
 		// I'm not entirely sure how this can happen to be honest. I tried deleting a
 		// container _while_ a server was running and wings gracefully saw the crash and
@@ -161,15 +161,13 @@ func (e *Environment) ExitState() (uint32, bool, error) {
 		if client.IsErrNotFound(err) {
 			return 1, false, nil
 		}
-
 		return 0, false, err
 	}
-
 	return uint32(c.State.ExitCode), c.State.OOMKilled, nil
 }
 
-// Returns the environment configuration allowing a process to make modifications of the
-// environment on the fly.
+// Config returns the environment configuration allowing a process to make
+// modifications of the environment on the fly.
 func (e *Environment) Config() *environment.Configuration {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -177,12 +175,11 @@ func (e *Environment) Config() *environment.Configuration {
 	return e.Configuration
 }
 
-// Sets the stop configuration for the environment.
+// SetStopConfiguration sets the stop configuration for the environment.
 func (e *Environment) SetStopConfiguration(c remote.ProcessStopConfiguration) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	e.meta.Stop = c
+	e.mu.Unlock()
 }
 
 func (e *Environment) SetImage(i string) {
@@ -213,4 +210,11 @@ func (e *Environment) SetState(state string) {
 		e.st.Store(state)
 		e.Events().Publish(environment.StateChangeEvent, state)
 	}
+}
+
+func (e *Environment) SetLogCallback(f func([]byte)) {
+	e.logCallbackMx.Lock()
+	defer e.logCallbackMx.Unlock()
+
+	e.logCallback = f
 }

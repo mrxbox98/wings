@@ -1,5 +1,103 @@
 # Changelog
 
+## v1.7.2
+### Fixed
+* The S3 backup driver now supports Cloudflare R2
+
+### Added
+* During a server transfer, there is a new "Archiving" status that outputs the progress of creating the server transfer archive.
+* Adds a configuration option to control the list of trusted proxies that can be used to determine the client IP address.
+* Adds a configuration option to control the Docker username space setting when Wings creates containers.
+
+### Changed
+* Releases are now built using `Go 1.18` — the minimum version required to build Wings is now `Go 1.18`.
+
+## v1.7.1
+### Fixed
+* YAML parser has been updated to fix some strange issues
+
+### Added
+* Added `Force Outgoing IP` option for servers to ensure outgoing traffic uses the server's IP address
+* Adds an option to control the level of gzip compression for backups
+
+## v1.7.0
+### Fixed
+* Fixes multi-platform support for Wings' Docker image.
+
+### Added
+* Adds support for tracking of SFTP actions, power actions, server commands, and file uploads by utilizing a local SQLite database and processing events before sending them to the Panel.
+* Adds support for configuring the MTU on the `pterodactyl0` network.
+
+## v1.6.4
+### Fixed
+* Fixes a bug causing CPU limiting to not be properly applied to servers.
+* Fixes a bug causing zip archives to decompress without taking into account nested folder structures.
+
+## v1.6.3
+### Fixed
+* Fixes SFTP authentication failing for administrative users due to a permissions adjustment on the Panel.
+
+## v1.6.2
+### Fixed
+* Fixes file upload size not being properly enforced.
+* Fixes a bug that prevented listing a directory when it contained a named pipe. Also added a check to prevent attempting to read a named pipe directly.
+* Fixes a bug with the archiver logic that would include folders that had the same name prefix. (for example, requesting only `map` would also include `map2` and `map3`)
+* Requests to the Panel that return a client error (4xx response code) no longer trigger an exponential backoff, they immediately stop the request.
+
+### Changed
+* CPU limit fields are only set on the Docker container if they have been specified for the server — otherwise they are left empty.
+
+### Added
+* Added the ability to define the location of the temporary folder used by Wings — defaults to `/tmp/pterodactyl`.
+* Adds the ability to authenticate for SFTP using public keys (requires `Panel@1.8.0`).
+
+## v1.6.1
+### Fixed
+* Fixes error that would sometimes occur when starting a server that would cause the temporary power action lock to never be released due to a blocked channel.
+* Fixes a bug causing the CPU usage of Wings to get stuck at 100% when a server is deleted while the installation process is running.
+
+### Changed
+* Cleans up a lot of the logic for handling events between the server and environment process to make it easier to make modifications to down the road.
+* Cleans up logic handling the `StopAndWait` logic for stopping a server gracefully before terminating the process if it does not respond.
+
+## v1.6.0
+### Fixed
+* Internal logic for processing a server start event has been adjusted to attach to the Docker container before attempting to start the container. This should fix issues where a server would get stuck after pulling the container image.
+* Fixes a bug in the console output that was dropping console lines when a large number of lines were sent at once.
+
+### Changed
+* Removed the console throttle logic that would terminate a server instance that was sending too much data. This logic has been replaced with simpler logic that only throttles the console, it does not try to terminate the server. In addition, this change has reduced the number of go-routines needed by the application and dramatically simplified internal logic.
+* Removed the `--profiler` flag and replaced it with `--pprof` which will start an internal server listening on `localhost:6060` allowing you to use Go's standard `pprof` tooling.
+* Replaced the `json` log driver for Docker containers with `local` to reduce the amount of overhead when it comes to streaming logs from instances.
+
+## v1.5.6
+### Fixed
+* Rewrote handler logic for the power actions lock to hopefully address issues people have been having when a server crashes and they're unable to start it again until restarting Wings.
+* Fixes files uploaded with SFTP not being owned by the Pterodactyl user.
+* Fixes excessive memory usage when large lines are sent through the console event handler.
+
+### Changed
+* Replaced usage of `encoding/json` throughout the codebase with a more performant encoder (`goccy/go-json`) to hopefully improve overall performance for JSON operations.
+* Added custom `ContainerInspect` function to handle direct calls to Docker's CLI and make use of the new JSON encoder logic. This should reduce the total number of memory allocations and be more performant overall in a hot pathway.
+
+## v1.5.5
+### Fixed
+* Fixes sending to a closed channel when sending server logs over the websocket
+* Fixes `wings diagnostics` uploading no content
+* Fixes a panic caused by the event bus closing channels multiple times when a server is deleted
+
+## v1.5.4
+### Fixed
+* Fixes SSL paths being improperly converted to lowercase in environments where the path is case-sensitive.
+* Fixes a memory leak due to the implemention of server event processing.
+
+### Changed
+* Selecting to redact information now redacts URLs from the log output when running the diagnostic command.
+
+### Added
+* Adds support for modifying the default memory overhead percentages in environments where the shipped values are not adequate.
+* Adds support for sending the `Access-Control-Request-Private-Network` header in environments where Wings will be accessed over a private network. This is defaulted to `off`.
+
 ## v1.5.3
 ### Fixed
 * Fixes improper event registration and error handling during socket authentication that would cause the incorrect error message to be returned to the client, or no error in some scenarios. Event registration is now delayed until the socket is fully authenticated to ensure needless listeners are not registed.

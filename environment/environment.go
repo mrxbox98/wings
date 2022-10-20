@@ -3,12 +3,12 @@ package environment
 import (
 	"context"
 	"os"
+	"time"
 
 	"github.com/pterodactyl/wings/events"
 )
 
 const (
-	ConsoleOutputEvent       = "console output"
 	StateChangeEvent         = "state change"
 	ResourceEvent            = "resources"
 	DockerImagePullStarted   = "docker image pull started"
@@ -35,7 +35,7 @@ type ProcessEnvironment interface {
 	// Returns an event emitter instance that can be hooked into to listen for different
 	// events that are fired by the environment. This should not allow someone to publish
 	// events, only subscribe to them.
-	Events() *events.EventBus
+	Events() *events.Bus
 
 	// Determines if the server instance exists. For example, in a docker environment
 	// this should confirm that the container is created and in a bootable state. In
@@ -59,18 +59,20 @@ type ProcessEnvironment interface {
 	// can be started an error should be returned.
 	Start(ctx context.Context) error
 
-	// Stops a server instance. If the server is already stopped an error should
-	// not be returned.
-	Stop() error
+	// Stop stops a server instance. If the server is already stopped an error will
+	// not be returned, this function will act as a no-op.
+	Stop(ctx context.Context) error
 
-	// Waits for a server instance to stop gracefully. If the server is still detected
-	// as running after seconds, an error will be returned, or the server will be terminated
-	// depending on the value of the second argument.
-	WaitForStop(seconds uint, terminate bool) error
+	// WaitForStop waits for a server instance to stop gracefully. If the server is
+	// still detected as running after "duration", an error will be returned, or the server
+	// will be terminated depending on the value of the second argument. If the context
+	// provided is canceled the underlying wait conditions will be stopped and the
+	// entire loop will be ended (potentially without stopping or terminating).
+	WaitForStop(ctx context.Context, duration time.Duration, terminate bool) error
 
-	// Terminates a running server instance using the provided signal. If the server
-	// is not running no error should be returned.
-	Terminate(signal os.Signal) error
+	// Terminate stops a running server instance using the provided signal. This function
+	// is a no-op if the server is already stopped.
+	Terminate(ctx context.Context, signal os.Signal) error
 
 	// Destroys the environment removing any containers that were created (in Docker
 	// environments at least).
@@ -108,4 +110,7 @@ type ProcessEnvironment interface {
 	// Uptime returns the current environment uptime in milliseconds. This is
 	// the time that has passed since it was last started.
 	Uptime(ctx context.Context) (int64, error)
+
+	// SetLogCallback sets the callback that the container's log output will be passed to.
+	SetLogCallback(func([]byte))
 }

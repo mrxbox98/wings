@@ -2,18 +2,23 @@ package websocket
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/pterodactyl/wings/internal/models"
+
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gbrlsnchs/jwt/v3"
+	"github.com/gin-gonic/gin"
+	"github.com/goccy/go-json"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
+	"github.com/pterodactyl/wings/system"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
@@ -39,6 +44,7 @@ type Handler struct {
 	Connection   *websocket.Conn `json:"-"`
 	jwt          *tokens.WebsocketPayload
 	server       *server.Server
+	ra           server.RequestActivity
 	uuid         uuid.UUID
 }
 
@@ -76,7 +82,7 @@ func NewTokenPayload(token []byte) (*tokens.WebsocketPayload, error) {
 }
 
 // GetHandler returns a new websocket handler using the context provided.
-func GetHandler(s *server.Server, w http.ResponseWriter, r *http.Request) (*Handler, error) {
+func GetHandler(s *server.Server, w http.ResponseWriter, r *http.Request, c *gin.Context) (*Handler, error) {
 	upgrader := websocket.Upgrader{
 		// Ensure that the websocket request is originating from the Panel itself,
 		// and not some other location.
@@ -108,6 +114,7 @@ func GetHandler(s *server.Server, w http.ResponseWriter, r *http.Request) (*Hand
 		Connection: conn,
 		jwt:        nil,
 		server:     s,
+		ra:         s.NewRequestActivity("", c.ClientIP()),
 		uuid:       u,
 	}, nil
 }
@@ -122,18 +129,17 @@ func (h *Handler) Logger() *log.Entry {
 		WithField("server", h.server.ID())
 }
 
-func (h *Handler) SendJson(v *Message) error {
+func (h *Handler) SendJson(v Message) error {
 	// Do not send JSON down the line if the JWT on the connection is not valid!
 	if err := h.TokenValid(); err != nil {
-		h.unsafeSendJson(Message{
+		_ = h.unsafeSendJson(Message{
 			Event: JwtErrorEvent,
 			Args:  []string{err.Error()},
 		})
 		return nil
 	}
 
-	j := h.GetJwt()
-	if j != nil {
+	if j := h.GetJwt(); j != nil {
 		// If we're sending installation output but the user does not have the required
 		// permissions to see the output, don't send it down the line.
 		if v.Event == server.InstallOutputEvent {
@@ -264,6 +270,7 @@ func (h *Handler) GetJwt() *tokens.WebsocketPayload {
 // setJwt sets the JWT for the websocket in a race-safe manner.
 func (h *Handler) setJwt(token *tokens.WebsocketPayload) {
 	h.Lock()
+	h.ra = h.ra.SetUser(token.UserUUID)
 	h.jwt = token
 	h.Unlock()
 }
@@ -297,7 +304,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			h.setJwt(token)
 
 			// Tell the client they authenticated successfully.
-			h.unsafeSendJson(Message{Event: AuthenticationSuccessEvent})
+			_ = h.unsafeSendJson(Message{Event: AuthenticationSuccessEvent})
 
 			// Check if the client was refreshing their authentication token
 			// instead of authenticating for the first time.
@@ -315,7 +322,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			// On every authentication event, send the current server status back
 			// to the client. :)
 			state := h.server.Environment.State()
-			h.SendJson(&Message{
+			_ = h.SendJson(Message{
 				Event: server.StatusEvent,
 				Args:  []string{state},
 			})
@@ -327,7 +334,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 					_ = h.server.Filesystem().HasSpaceAvailable(false)
 
 					b, _ := json.Marshal(h.server.Proc())
-					h.SendJson(&Message{
+					_ = h.SendJson(Message{
 						Event: server.StatsEvent,
 						Args:  []string{string(b)},
 					})
@@ -354,15 +361,19 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			}
 
 			err := h.server.HandlePowerAction(action)
-			if errors.Is(err, context.DeadlineExceeded) {
+			if errors.Is(err, system.ErrLockerLocked) {
 				m, _ := h.GetErrorMessage("another power action is currently being processed for this server, please try again later")
 
-				h.SendJson(&Message{
+				_ = h.SendJson(Message{
 					Event: ErrorEvent,
 					Args:  []string{m},
 				})
 
 				return nil
+			}
+
+			if err == nil {
+				h.server.SaveActivity(h.ra, models.Event(server.ActivityPowerPrefix+action), nil)
 			}
 
 			return err
@@ -381,7 +392,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			}
 
 			for _, line := range logs {
-				h.SendJson(&Message{
+				_ = h.SendJson(Message{
 					Event: server.ConsoleOutputEvent,
 					Args:  []string{line},
 				})
@@ -392,7 +403,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 	case SendStatsEvent:
 		{
 			b, _ := json.Marshal(h.server.Proc())
-			h.SendJson(&Message{
+			_ = h.SendJson(Message{
 				Event: server.StatsEvent,
 				Args:  []string{string(b)},
 			})
@@ -421,7 +432,13 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 				}
 			}
 
-			return h.server.Environment.SendCommand(strings.Join(m.Args, ""))
+			if err := h.server.Environment.SendCommand(strings.Join(m.Args, "")); err != nil {
+				return err
+			}
+			h.server.SaveActivity(h.ra, server.ActivityConsoleCommand, models.ActivityMeta{
+				"command": strings.Join(m.Args, ""),
+			})
+			return nil
 		}
 	}
 

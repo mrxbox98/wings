@@ -79,7 +79,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 			s.Log().WithField("backup", b.Identifier()).Info("notified panel of failed backup state")
 		}
 
-		_ = s.Events().PublishJson(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+		s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
 			"uuid":          b.Identifier(),
 			"is_successful": false,
 			"checksum":      "",
@@ -103,7 +103,7 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 
 	// Emit an event over the socket so we can update the backup in realtime on
 	// the frontend for the server.
-	_ = s.Events().PublishJson(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
+	s.Events().Publish(BackupCompletedEvent+":"+b.Identifier(), map[string]interface{}{
 		"uuid":          b.Identifier(),
 		"is_successful": true,
 		"checksum":      ad.Checksum,
@@ -142,7 +142,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// instance, otherwise you'll likely hit all types of write errors due to the
 	// server being suspended.
 	if s.Environment.State() != environment.ProcessOfflineState {
-		if err = s.Environment.WaitForStop(120, false); err != nil {
+		if err = s.Environment.WaitForStop(s.Context(), time.Minute*2, false); err != nil {
 			if !client.IsErrNotFound(err) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}

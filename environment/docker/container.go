@@ -3,7 +3,6 @@ package docker
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -12,11 +11,12 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	"github.com/buger/jsonparser"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/daemon/logger/jsonfilelog"
+	"github.com/docker/docker/daemon/logger/local"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
@@ -38,13 +38,13 @@ func (nw noopWriter) Write(b []byte) (int, error) {
 }
 
 // Attach attaches to the docker container itself and ensures that we can pipe
-// data in and out of the process stream. This should not be used for reading
-// console data as you *will* miss important output at the beginning because of
-// the time delay with attaching to the output.
+// data in and out of the process stream. This should always be called before
+// you have started the container, but after you've ensured it exists.
 //
 // Calling this function will poll resources for the container in the background
-// until the provided context is canceled by the caller. Failure to cancel said
-// context will cause background memory leaks as the goroutine will not exit.
+// until the container is stopped. The context provided to this function is used
+// for the purposes of attaching to the container, a seecond context is created
+// within the function for managing polling.
 func (e *Environment) Attach(ctx context.Context) error {
 	if e.IsAttached() {
 		return nil
@@ -118,7 +118,7 @@ func (e *Environment) InSituUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	if _, err := e.client.ContainerInspect(ctx, e.Id); err != nil {
+	if _, err := e.ContainerInspect(ctx); err != nil {
 		// If the container doesn't exist for some reason there really isn't anything
 		// we can do to fix that in this process (it doesn't make sense at least). In those
 		// cases just return without doing anything since we still want to save the configuration
@@ -147,10 +147,12 @@ func (e *Environment) InSituUpdate() error {
 // currently available for it. If the container already exists it will be
 // returned.
 func (e *Environment) Create() error {
+	ctx := context.Background()
+
 	// If the container already exists don't hit the user with an error, just return
 	// the current information about it which is what we would do when creating the
 	// container anyways.
-	if _, err := e.client.ContainerInspect(context.Background(), e.Id); err == nil {
+	if _, err := e.ContainerInspect(ctx); err == nil {
 		return nil
 	} else if !client.IsErrNotFound(err) {
 		return errors.Wrap(err, "environment/docker: failed to inspect container")
@@ -172,10 +174,20 @@ func (e *Environment) Create() error {
 		}
 	}
 
+	// Merge user-provided labels with system labels
+	confLabels := e.Configuration.Labels()
+	labels := make(map[string]string, 2+len(confLabels))
+
+	for key := range confLabels {
+		labels[key] = confLabels[key]
+	}
+	labels["Service"] = "Pterodactyl"
+	labels["ContainerType"] = "server_process"
+
 	conf := &container.Config{
 		Hostname:     e.Id,
 		Domainname:   config.Get().Docker.Domainname,
-		User:         strconv.Itoa(config.Get().System.User.Uid),
+		User:         strconv.Itoa(config.Get().System.User.Uid) + ":" + strconv.Itoa(config.Get().System.User.Gid),
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
@@ -184,13 +196,37 @@ func (e *Environment) Create() error {
 		ExposedPorts: a.Exposed(),
 		Image:        strings.TrimPrefix(e.meta.Image, "~"),
 		Env:          e.Configuration.EnvironmentVariables(),
-		Labels: map[string]string{
-			"Service":       "Pterodactyl",
-			"ContainerType": "server_process",
-		},
+		Labels:       labels,
 	}
 
-	tmpfsSize := strconv.Itoa(int(config.Get().Docker.TmpfsSize))
+	networkMode := container.NetworkMode(config.Get().Docker.Network.Mode)
+	if a.ForceOutgoingIP {
+		e.log().Debug("environment/docker: forcing outgoing IP address")
+		networkName := strings.ReplaceAll(e.Id, "-", "")
+		networkMode = container.NetworkMode(networkName)
+
+		if _, err := e.client.NetworkInspect(ctx, networkName, types.NetworkInspectOptions{}); err != nil {
+			if !client.IsErrNotFound(err) {
+				return err
+			}
+
+			if _, err := e.client.NetworkCreate(ctx, networkName, types.NetworkCreate{
+				Driver:     "bridge",
+				EnableIPv6: false,
+				Internal:   false,
+				Attachable: false,
+				Ingress:    false,
+				ConfigOnly: false,
+				Options: map[string]string{
+					"encryption": "false",
+					"com.docker.network.bridge.default_bridge": "false",
+					"com.docker.network.host_ipv4":             a.DefaultMapping.Ip,
+				},
+			}); err != nil {
+				return err
+			}
+		}
+	}
 
 	hostConf := &container.HostConfig{
 		PortBindings: a.DockerBindings(),
@@ -202,7 +238,7 @@ func (e *Environment) Create() error {
 		// Configure the /tmp folder mapping in containers. This is necessary for some
 		// games that need to make use of it for downloads and other installation processes.
 		Tmpfs: map[string]string{
-			"/tmp": "rw,exec,nosuid,size=" + tmpfsSize + "M",
+			"/tmp": "rw,exec,nosuid,size=" + strconv.Itoa(int(config.Get().Docker.TmpfsSize)) + "M",
 		},
 
 		// Define resource limits for the container based on the data passed through
@@ -216,11 +252,12 @@ func (e *Environment) Create() error {
 		// since we only need it for the last few hundred lines of output and don't care
 		// about anything else in it.
 		LogConfig: container.LogConfig{
-			Type: jsonfilelog.Name,
+			Type: local.Name,
 			Config: map[string]string{
 				"max-size": "5m",
 				"max-file": "1",
 				"compress": "false",
+				"mode":     "non-blocking",
 			},
 		},
 
@@ -230,10 +267,11 @@ func (e *Environment) Create() error {
 			"setpcap", "mknod", "audit_write", "net_raw", "dac_override",
 			"fowner", "fsetid", "net_bind_service", "sys_chroot", "setfcap",
 		},
-		NetworkMode: container.NetworkMode(config.Get().Docker.Network.Mode),
+		NetworkMode: networkMode,
+		UsernsMode:  container.UsernsMode(config.Get().Docker.UsernsMode),
 	}
 
-	if _, err := e.client.ContainerCreate(context.Background(), conf, hostConf, nil, nil, e.Id); err != nil {
+	if _, err := e.client.ContainerCreate(ctx, conf, hostConf, nil, nil, e.Id); err != nil {
 		return errors.Wrap(err, "environment/docker: failed to create container")
 	}
 
@@ -342,10 +380,10 @@ func (e *Environment) followOutput() error {
 func (e *Environment) scanOutput(reader io.ReadCloser) {
 	defer reader.Close()
 
-	events := e.Events()
-
-	if err := system.ScanReader(reader, func(line string) {
-		events.Publish(environment.ConsoleOutputEvent, line)
+	if err := system.ScanReader(reader, func(v []byte) {
+		e.logCallbackMx.Lock()
+		defer e.logCallbackMx.Unlock()
+		e.logCallback(v)
 	}); err != nil && err != io.EOF {
 		log.WithField("error", err).WithField("container_id", e.Id).Warn("error processing scanner line in console output")
 		return
@@ -362,11 +400,6 @@ func (e *Environment) scanOutput(reader io.ReadCloser) {
 
 	// Start following the output of the server again.
 	go e.followOutput()
-}
-
-type imagePullStatus struct {
-	Status   string `json:"status"`
-	Progress string `json:"progress"`
 }
 
 // Pulls the image from Docker. If there is an error while pulling the image
@@ -454,12 +487,11 @@ func (e *Environment) ensureImageExists(image string) error {
 	scanner := bufio.NewScanner(out)
 
 	for scanner.Scan() {
-		s := imagePullStatus{}
-		fmt.Println(scanner.Text())
+		b := scanner.Bytes()
+		status, _ := jsonparser.GetString(b, "status")
+		progress, _ := jsonparser.GetString(b, "progress")
 
-		if err := json.Unmarshal(scanner.Bytes(), &s); err == nil {
-			e.Events().Publish(environment.DockerImagePullStatus, s.Status+" "+s.Progress)
-		}
+		e.Events().Publish(environment.DockerImagePullStatus, status+" "+progress)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -484,22 +516,4 @@ func (e *Environment) convertMounts() []mount.Mount {
 	}
 
 	return out
-}
-
-func (e *Environment) resources() container.Resources {
-	l := e.Configuration.Limits()
-	pids := l.ProcessLimit()
-
-	return container.Resources{
-		Memory:            l.BoundedMemoryLimit(),
-		MemoryReservation: l.MemoryLimit * 1_000_000,
-		MemorySwap:        l.ConvertedSwap(),
-		CPUQuota:          l.ConvertedCpuLimit(),
-		CPUPeriod:         100_000,
-		CPUShares:         1024,
-		BlkioWeight:       l.IoWeight,
-		OomKillDisable:    &l.OOMDisabled,
-		CpusetCpus:        l.Threads,
-		PidsLimit:         &pids,
-	}
 }

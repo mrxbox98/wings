@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/gammazero/workerpool"
+	"github.com/goccy/go-json"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/environment"
@@ -50,6 +50,24 @@ func NewEmptyManager(client remote.Client) *Manager {
 // Panel API.
 func (m *Manager) Client() remote.Client {
 	return m.client
+}
+
+// Len returns the count of servers stored in the manager instance.
+func (m *Manager) Len() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.servers)
+}
+
+// Keys returns all of the server UUIDs stored in the manager set.
+func (m *Manager) Keys() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	keys := make([]string, len(m.servers))
+	for i, s := range m.servers {
+		keys[i] = s.ID()
+	}
+	return keys
 }
 
 // Put replaces all the current values in the collection with the value that
@@ -187,6 +205,7 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		Mounts:      s.Mounts(),
 		Allocations: s.cfg.Allocations,
 		Limits:      s.cfg.Build,
+		Labels:      s.cfg.Labels,
 	}
 
 	envCfg := environment.NewConfiguration(settings, s.GetEnvironmentVariables())
@@ -199,7 +218,6 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 	} else {
 		s.Environment = env
 		s.StartEventListeners()
-		s.Throttler().StartTimer(s.Context())
 	}
 
 	// If the server's data directory exists, force disk usage calculation.

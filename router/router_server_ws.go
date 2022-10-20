@@ -2,10 +2,10 @@ package router
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/goccy/go-json"
 	ws "github.com/gorilla/websocket"
 
 	"github.com/pterodactyl/wings/router/middleware"
@@ -32,7 +32,7 @@ func getServerWebsocket(c *gin.Context) {
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	defer cancel()
 
-	handler, err := websocket.GetHandler(s, c.Writer, c.Request)
+	handler, err := websocket.GetHandler(s, c.Writer, c.Request, c)
 	if err != nil {
 		NewServerError(err, s).Abort(c)
 		return

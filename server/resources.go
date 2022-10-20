@@ -38,6 +38,13 @@ func (s *Server) Proc() ResourceUsage {
 	return s.resources
 }
 
+// UpdateStats updates the current stats for the server's resource usage.
+func (ru *ResourceUsage) UpdateStats(stats environment.Stats) {
+	ru.mu.Lock()
+	ru.Stats = stats
+	ru.mu.Unlock()
+}
+
 // Reset resets the usages values to zero, used when a server is stopped to ensure we don't hold
 // onto any values incorrectly.
 func (ru *ResourceUsage) Reset() {
@@ -49,10 +56,4 @@ func (ru *ResourceUsage) Reset() {
 	ru.Uptime = 0
 	ru.Network.TxBytes = 0
 	ru.Network.RxBytes = 0
-}
-
-func (s *Server) emitProcUsage() {
-	if err := s.Events().PublishJson(StatsEvent, s.Proc()); err != nil {
-		s.Log().WithField("error", err).Warn("error while emitting server resource usage to listeners")
-	}
 }

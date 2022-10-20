@@ -6,7 +6,11 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/goccy/go-json"
+
 	"github.com/pterodactyl/wings/events"
+	"github.com/pterodactyl/wings/system"
+
 	"github.com/pterodactyl/wings/server"
 )
 
@@ -53,9 +57,9 @@ func (h *Handler) listenForExpiration(ctx context.Context) {
 			jwt := h.GetJwt()
 			if jwt != nil {
 				if jwt.ExpirationTime.Unix()-time.Now().Unix() <= 0 {
-					_ = h.SendJson(&Message{Event: TokenExpiredEvent})
+					_ = h.SendJson(Message{Event: TokenExpiredEvent})
 				} else if jwt.ExpirationTime.Unix()-time.Now().Unix() <= 60 {
-					_ = h.SendJson(&Message{Event: TokenExpiringEvent})
+					_ = h.SendJson(Message{Event: TokenExpiringEvent})
 				}
 			}
 		}
@@ -79,38 +83,82 @@ var e = []string{
 // ListenForServerEvents will listen for different events happening on a server
 // and send them along to the connected websocket client. This function will
 // block until the context provided to it is canceled.
-func (h *Handler) listenForServerEvents(pctx context.Context) error {
+func (h *Handler) listenForServerEvents(ctx context.Context) error {
 	var o sync.Once
 	var err error
-	ctx, cancel := context.WithCancel(pctx)
 
-	callback := func(e events.Event) {
-		if sendErr := h.SendJson(&Message{Event: e.Topic, Args: []string{e.Data}}); sendErr != nil {
-			h.Logger().WithField("event", e.Topic).WithField("error", sendErr).Error("failed to send event over server websocket")
-			// Avoid race conditions by only setting the error once and then canceling
-			// the context. This way if additional processing errors come through due
-			// to a massive flood of things you still only report and stop at the first.
-			o.Do(func() {
-				err = sendErr
-				cancel()
-			})
-		}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	eventChan := make(chan []byte)
+	logOutput := make(chan []byte, 8)
+	installOutput := make(chan []byte, 4)
+
+	h.server.Events().On(eventChan) // TODO: make a sinky
+	h.server.Sink(system.LogSink).On(logOutput)
+	h.server.Sink(system.InstallSink).On(installOutput)
+
+	onError := func(evt string, err2 error) {
+		h.Logger().WithField("event", evt).WithField("error", err2).Error("failed to send event over server websocket")
+		// Avoid race conditions by only setting the error once and then canceling
+		// the context. This way if additional processing errors come through due
+		// to a massive flood of things you still only report and stop at the first.
+		o.Do(func() {
+			err = err2
+		})
+		cancel()
 	}
 
-	// Subscribe to all of the events with the same callback that will push the
-	// data out over the websocket for the server.
-	for _, evt := range e {
-		h.server.Events().On(evt, &callback)
+	for {
+		select {
+		case <-ctx.Done():
+			break
+		case b := <-logOutput:
+			sendErr := h.SendJson(Message{Event: server.ConsoleOutputEvent, Args: []string{string(b)}})
+			if sendErr == nil {
+				continue
+			}
+			onError(server.ConsoleOutputEvent, sendErr)
+		case b := <-installOutput:
+			sendErr := h.SendJson(Message{Event: server.InstallOutputEvent, Args: []string{string(b)}})
+			if sendErr == nil {
+				continue
+			}
+			onError(server.InstallOutputEvent, sendErr)
+		case b := <-eventChan:
+			var e events.Event
+			if err := events.DecodeTo(b, &e); err != nil {
+				continue
+			}
+			var sendErr error
+			message := Message{Event: e.Topic}
+			if str, ok := e.Data.(string); ok {
+				message.Args = []string{str}
+			} else if b, ok := e.Data.([]byte); ok {
+				message.Args = []string{string(b)}
+			} else {
+				b, sendErr = json.Marshal(e.Data)
+				if sendErr == nil {
+					message.Args = []string{string(b)}
+				}
+			}
+
+			if sendErr == nil {
+				sendErr = h.SendJson(message)
+				if sendErr == nil {
+					continue
+				}
+			}
+			onError(message.Event, sendErr)
+		}
+		break
 	}
 
-	// When this function returns de-register all of the event listeners.
-	defer func() {
-		for _, evt := range e {
-			h.server.Events().Off(evt, &callback)
-		}
-	}()
+	// These functions will automatically close the channel if it hasn't been already.
+	h.server.Events().Off(eventChan)
+	h.server.Sink(system.LogSink).Off(logOutput)
+	h.server.Sink(system.InstallSink).Off(installOutput)
 
-	<-ctx.Done()
 	// If the internal context is stopped it is either because the parent context
 	// got canceled or because we ran into an error. If the "err" variable is nil
 	// we can assume the parent was canceled and need not perform any actions.

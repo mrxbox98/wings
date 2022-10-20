@@ -3,7 +3,6 @@ package remote
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pterodactyl/wings/internal/models"
+
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/cenkalti/backoff/v4"
+	"github.com/goccy/go-json"
 
 	"github.com/pterodactyl/wings/system"
 )
@@ -30,6 +32,7 @@ type Client interface {
 	SetInstallationStatus(ctx context.Context, uuid string, successful bool) error
 	SetTransferStatus(ctx context.Context, uuid string, successful bool) error
 	ValidateSftpCredentials(ctx context.Context, request SftpAuthRequest) (SftpAuthResponse, error)
+	SendActivityLogs(ctx context.Context, activity []models.Activity) error
 }
 
 type client struct {
@@ -128,10 +131,19 @@ func (c *client) requestOnce(ctx context.Context, method, path string, body io.R
 // and adds the required authentication headers to the request that is being
 // created. Errors returned will be of the RequestError type if there was some
 // type of response from the API that can be parsed.
-func (c *client) request(ctx context.Context, method, path string, body io.Reader, opts ...func(r *http.Request)) (*Response, error) {
+func (c *client) request(ctx context.Context, method, path string, body *bytes.Buffer, opts ...func(r *http.Request)) (*Response, error) {
 	var res *Response
 	err := backoff.Retry(func() error {
-		r, err := c.requestOnce(ctx, method, path, body, opts...)
+		var b bytes.Buffer
+		if body != nil {
+			// We have to create a copy of the body, otherwise attempting this request again will
+			// send no data if there was initially a body since the "requestOnce" method will read
+			// the whole buffer, thus leaving it empty at the end.
+			if _, err := b.Write(body.Bytes()); err != nil {
+				return backoff.Permanent(errors.Wrap(err, "http: failed to copy body buffer"))
+			}
+		}
+		r, err := c.requestOnce(ctx, method, path, &b, opts...)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return backoff.Permanent(err)
@@ -142,12 +154,10 @@ func (c *client) request(ctx context.Context, method, path string, body io.Reade
 		if r.HasError() {
 			// Close the request body after returning the error to free up resources.
 			defer r.Body.Close()
-			// Don't keep spamming the endpoint if we've already made too many requests or
-			// if we're not even authenticated correctly. Retrying generally won't fix either
-			// of these issues.
-			if r.StatusCode == http.StatusForbidden ||
-				r.StatusCode == http.StatusTooManyRequests ||
-				r.StatusCode == http.StatusUnauthorized {
+			// Don't keep attempting to access this endpoint if the response is a 4XX
+			// level error which indicates a client mistake. Only retry when the error
+			// is due to a server issue (5XX error).
+			if r.StatusCode >= 400 && r.StatusCode < 500 {
 				return backoff.Permanent(r.Error())
 			}
 			return r.Error()

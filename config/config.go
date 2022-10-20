@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/acobaugh/osrelease"
 	"github.com/apex/log"
-	"github.com/cobaugh/osrelease"
 	"github.com/creasty/defaults"
 	"github.com/gbrlsnchs/jwt/v3"
 	"gopkg.in/yaml.v2"
@@ -89,8 +89,11 @@ type ApiConfiguration struct {
 	// servers.
 	DisableRemoteDownload bool `json:"disable_remote_download" yaml:"disable_remote_download"`
 
-	// The maximum size for files uploaded through the Panel in bytes.
-	UploadLimit int `default:"100" json:"upload_limit" yaml:"upload_limit"`
+	// The maximum size for files uploaded through the Panel in MB.
+	UploadLimit int64 `default:"100" json:"upload_limit" yaml:"upload_limit"`
+
+	// A list of IP address of proxies that may send a X-Forwarded-For header to set the true clients IP
+	TrustedProxies []string `json:"trusted_proxies" yaml:"trusted_proxies"`
 }
 
 // RemoteQueryConfiguration defines the configuration settings for remote requests
@@ -132,6 +135,10 @@ type SystemConfiguration struct {
 	// Directory where local backups will be stored on the machine.
 	BackupDirectory string `default:"/var/lib/pterodactyl/backups" yaml:"backup_directory"`
 
+	// TmpDirectory specifies where temporary files for Pterodactyl installation processes
+	// should be created. This supports environments running docker-in-docker.
+	TmpDirectory string `default:"/tmp/pterodactyl" yaml:"tmp_directory"`
+
 	// The user that should own all of the server files, and be used for containers.
 	Username string `default:"pterodactyl" yaml:"username"`
 
@@ -158,6 +165,15 @@ type SystemConfiguration struct {
 	// by a server and should only be set in extreme scenarios where performance is critical and
 	// disk usage is not a concern.
 	DiskCheckInterval int64 `default:"150" yaml:"disk_check_interval"`
+
+	// ActivitySendInterval is the amount of time that should ellapse between aggregated server activity
+	// being sent to the Panel. By default this will send activity collected over the last minute. Keep
+	// in mind that only a fixed number of activity log entries, defined by ActivitySendCount, will be sent
+	// in each run.
+	ActivitySendInterval int `default:"60" yaml:"activity_send_interval"`
+
+	// ActivitySendCount is the number of activity events to send per batch.
+	ActivitySendCount int `default:"100" yaml:"activity_send_count"`
 
 	// If set to true, file permissions for a server will be checked when the process is
 	// booted. This can cause boot delays if the server has a large amount of files. In most
@@ -206,6 +222,15 @@ type Backups struct {
 	//
 	// Defaults to 0 (unlimited)
 	WriteLimit int `default:"0" yaml:"write_limit"`
+
+	// CompressionLevel determines how much backups created by wings should be compressed.
+	//
+	// "none" -> no compression will be applied
+	// "best_speed" -> uses gzip level 1 for fast speed
+	// "best_compression" -> uses gzip level 9 for minimal disk space useage
+	//
+	// Defaults to "best_speed" (level 1)
+	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
 }
 
 type Transfers struct {
@@ -222,26 +247,14 @@ type ConsoleThrottles struct {
 	// Whether or not the throttler is enabled for this instance.
 	Enabled bool `json:"enabled" yaml:"enabled" default:"true"`
 
-	// The total number of lines that can be output in a given LineResetInterval period before
+	// The total number of lines that can be output in a given Period period before
 	// a warning is triggered and counted against the server.
 	Lines uint64 `json:"lines" yaml:"lines" default:"2000"`
-
-	// The total number of throttle activations that can accumulate before a server is considered
-	// to be breaching and will be stopped. This value is decremented by one every DecayInterval.
-	MaximumTriggerCount uint64 `json:"maximum_trigger_count" yaml:"maximum_trigger_count" default:"5"`
 
 	// The amount of time after which the number of lines processed is reset to 0. This runs in
 	// a constant loop and is not affected by the current console output volumes. By default, this
 	// will reset the processed line count back to 0 every 100ms.
-	LineResetInterval uint64 `json:"line_reset_interval" yaml:"line_reset_interval" default:"100"`
-
-	// The amount of time in milliseconds that must pass without an output warning being triggered
-	// before a throttle activation is decremented.
-	DecayInterval uint64 `json:"decay_interval" yaml:"decay_interval" default:"10000"`
-
-	// The amount of time that a server is allowed to be stopping for before it is terminated
-	// forcefully if it triggers output throttles.
-	StopGracePeriod uint `json:"stop_grace_period" yaml:"stop_grace_period" default:"15"`
+	Period uint64 `json:"line_reset_interval" yaml:"line_reset_interval" default:"100"`
 }
 
 type Configuration struct {
@@ -286,6 +299,12 @@ type Configuration struct {
 	// The Panel URL is automatically allowed, this is only needed for adding
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
+
+	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
+	// is only required by users running Wings without SSL certificates and using internal IP
+	// addresses in order to connect. Most users should NOT enable this setting.
+	AllowCORSPrivateNetwork bool `json:"allow_cors_private_network" yaml:"allow_cors_private_network"`
 }
 
 // NewAtPath creates a new struct and set the path where it should be stored.
